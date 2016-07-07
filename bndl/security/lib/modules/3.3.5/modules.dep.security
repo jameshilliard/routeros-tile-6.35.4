@@ -1,0 +1,3 @@
+blowfish_generic:	blowfish_common
+ghash-generic:	gf128mul
+twofish_generic:	twofish_common

@@ -1,0 +1,6 @@
+dlog_info '
+  :put "\nIP SETTINGS"
+  /ip settings print
+  :put "\nIP DNS"
+  /ip dns print
+'

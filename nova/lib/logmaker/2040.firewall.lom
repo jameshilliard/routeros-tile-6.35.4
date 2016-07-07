@@ -1,0 +1,16 @@
+dlog_info '
+  /ip firewall {
+    :put MANGLE
+    mangle print all
+    :put NAT
+    nat print all
+    :put FILTER
+    filter print all
+    :put TRACKING
+    connection tracking print
+    :put CONNECTION
+    connection print
+    :put ADDRESS-LIST
+    :if ([address-list print count-only] < 10000) do { address-list print detail }
+  }
+'

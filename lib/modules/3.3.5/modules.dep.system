@@ -1,0 +1,39 @@
+panics:	flash
+ohci-hcd:	usbcore
+cdc_ether:	usbcore usbnet
+phy_amcc_qt2025:	phy_helper
+sierra_net:	usbcore usbnet
+ahci:	libahci libata
+switch:	packet_hook phy_helper
+traffic_gen:	packet_hook
+usb-storage:	usbcore usb-libusual
+usbhid:	usbcore
+packet_hook:	nf_conntrack
+usbnet:	usbcore
+mesh:	packet_hook
+option:	usbcore usbserial usb_wwan
+imq:	cls_fw cls_linear
+tilegx:	switch packet_hook phy_helper phy_amcc_qt2025 phy_ti_tlk10232
+ehci-hcd:	usbcore
+phy_ti_tlk10232:	phy_helper
+atl1c:	packet_hook
+lcd:	flash
+cdc-acm:	usbcore
+ath8327:	phy_helper switch
+cp210x:	usbcore usbserial
+rndis_host:	usbcore cdc_ether usbnet
+ts:	flash
+usb-libusual:	usbcore
+pl2303:	usbcore usbserial
+usb_wwan:	usbcore usbserial
+ftdi_sio:	usbcore usbserial
+ch341:	usbcore usbserial
+rb:	flash
+sierra:	usbcore usbserial
+romon:	packet_hook
+qcserial:	usbcore usbserial usb_wwan
+libahci:	libata
+hso:	rfkill usbcore
+usbserial:	usbcore
+ipw:	usbcore usbserial usb_wwan
+usbcore:	usb-common

@@ -1,0 +1,1087 @@
+#
+# version 4.0
+#
+# Now board have defined one of the Config Modes:
+#  * cpe_router - wireless (or LTE) is fw protected gateway
+#  * repeater - bridged two wlans one ap other station
+#  * ap_router (dual, single) - ether1 protected gw, wlan AP bridged with LAN ports
+#  * ptp_bridge (AP, CPE) - bridged ethernet with wireless
+#  * wisp_bridge (AP) - bridged ethernet with wireless  (ap-bridge mode)
+#  * switch - all interfaces switched and ip address on master port
+#
+# No need to define common config settings for each board. Now they are defined in config mode
+#
+# TODO:
+#  * Do not rely on RB name to determine wireless features. Use hw-info instead
+#     when there will be added support to use it in scripts (BUG: 6709)
+#  * add ptp-bridge modes (currently none of the boards need it)
+#  *
+
+
+
+#-------------------------------------------------------------------------------
+# Global vars
+#-------------------------------------------------------------------------------
+:global strDesc "";
+:global strConf "";
+:global NL "\r\n";
+
+:global configMode "";
+:global dhcpEnabled 0
+:global wirelessEnabled 0
+:global wirelessAcEnabled 0
+
+#-------------------------------------------------------------------------------
+# Utilities
+#-------------------------------------------------------------------------------
+:global addConfLine do={
+  :global strConf;
+  :global NL;
+  :set strConf ($strConf . $1 . $NL)
+}
+
+:global addDescLine do={
+  :global strDesc;
+  :global NL;
+  :set strDesc ($strDesc . $1 . $NL)
+}
+
+# check if provided character is number
+:global isNum do={
+  :return ($1~"[1-9]")
+}
+
+#-------------------------------------------------------------------------------
+# findNextSection - function finds next section from board name
+#-------------------------------------------------------------------------------
+:global findNextSection do={
+  :local ret 0;
+  :local tmp;
+  :local ret $2
+  :do {
+    :set tmp [:pick $1 $ret]
+    :set ret ($ret+1);
+  } while=(!(($tmp~"[- ]") || ($ret > [:len $1])))
+  :return $ret
+}
+
+#-------------------------------------------------------------------------------
+# getFeatureString - try to get string describing board features from board name
+#  returns an array of (board prefix, wireless, isAp, other)
+#-------------------------------------------------------------------------------
+:global getFeatureString do={
+  :global findNextSection;
+
+  :local prefix "";
+  :local model "";
+  :local wireless "";
+  :local other "";
+  :local end 0;
+  :local tmp "";
+  :local pos 0;
+  :local oldPos 0;
+  :local isAp 0;
+  :local numSfp 0;
+  :local numSfpPlus 0;
+  :local numGig 0;
+  :local numCombo 0;
+  :local isLte 0;
+
+  :set pos [$findNextSection $boardStr $oldPos]
+  :set prefix [:pick $boardStr 0 ($pos-1)]
+
+  #get board model (new style)
+  :if ($prefix ~ "RouterBOARD|Cloud") do={
+    :set oldPos $pos
+    :set pos [$findNextSection $boardStr $oldPos]
+    :set model [:pick $boardStr $oldPos ($pos-1)]
+  }
+
+  # old style
+  :if ($prefix ~ "CRS") do={
+    :set prefix "CloudRouterSwitch"
+    :set model [:pick $boardStr ($oldPos+3) ($pos-1)]
+  } else={
+    :if ($prefix ~ "RB") do={
+      :set prefix "RouterBOARD"
+      :set model [:pick $boardStr ($oldPos+2) ($pos-1)]
+    } else={
+      :set prefix "RouterBOARD"
+      :set model [:pick $boardStr $oldPos ($pos-1)]
+    }
+  }
+
+  # skip G right after board name
+  :if ([:pick $boardStr $pos] = "G") do={ :set pos ($pos+1)}
+  :if ([:pick $boardStr $pos] = "A") do={ :set isAp 1; :set pos ($pos+1)}
+  #add additional check cause there may be L and LTE boards
+  :if ([:pick $boardStr $pos] = "L") do={
+    :if ([:pick $boardStr $pos ($pos+3)] = "LTE") do={
+      :set isLte 1;
+      :set pos ($pos+3);
+    } else={
+      :set other "L";
+      :set pos ($pos+1);
+    }
+  }
+
+  :local matched 0;
+  :local break 0;
+  :do {
+    :set oldPos $pos
+    :set pos [$findNextSection $boardStr $oldPos]
+    :set tmp [:pick $boardStr $oldPos ($pos-1)]
+
+    # break parser for now if board has LTE iface
+    :if ($tmp~"LTE") do={
+      :set isLte 1;
+      :set break 1;
+    }
+
+    # ccr port count
+    :if ($tmp~"^[0-9GCS+]*\$") do={
+      :set matched 1
+      :if ($tmp~"G") do={
+        :set numGig [:pick $tmp 0 [:find $tmp "G"]]
+      } else={
+        if ($tmp~"C") do={
+          :set numCombo [:pick $tmp 0 [:find $tmp "C"]]
+        } else={
+          :if ($tmp~"S\\+\$") do={
+            :set numSfpPlus [:pick $tmp 0 [:find $tmp "S+"]]
+          } else={
+            :set numSfp [:pick $tmp 0 [:find $tmp "S"]]
+          }
+        }
+      }
+    } else={
+      # wireless
+      :if ($tmp~"^[0-9SHPacnDTQ]*\$") do={
+        :set matched 1
+        :set wireless "$wireless $[:pick $boardStr $oldPos $pos]"
+      }
+    }
+    :if ($matched = 0) do={
+      :set other ($other . [:pick $boardStr $oldPos $pos])
+    }
+  } while=($pos < [:len $boardStr] && break = 0)
+
+  :return {"prefix"=$prefix; "model"=$model; "wireless"=$wireless;"isAp"=$isAp;"numGig"=$numGig;"numSfp"=$numSfp;"numSfpPlus"=$numSfpPlus; "numCombo"=$numCombo; "isLte"=$isLte; "other"=$other}
+}
+
+
+#-------------------------------------------------------------------------------
+# parseWirelessFeatures - parse wireless features from board name
+#  returns array of elements (band, chains, isAc, isN, frequencyMode)
+#-------------------------------------------------------------------------------
+:global parseWirelessFeatures do={
+  :global isNum
+
+  :local frequency ""
+  :local isN 0
+  :local isAc 0
+  :local chains "0"
+
+  :local band;
+  :local tmp 0;
+  :local pos 0;
+
+  :local cardNext 0;
+  :local outArray {"w1"="0"};
+
+  :do {
+    #settings for each card starts with frequency number
+    :set tmp [:pick $list $pos];
+    :if ([$isNum $tmp]) do={
+      :if ([$isNum [:pick $list ($pos+1)]]) do={
+        :set pos ($pos+1)
+        :set tmp ($tmp . [:pick $list $pos])
+      }
+      # set current card
+      :if ($cardNext > 0) do={
+        :set ($outArray->"w$cardNext") {"chains"=$chains;"isAc"=$isAc;"isN"=$isN;"frequencyMode"=$frequency}
+      }
+      :set frequency [:tonum $tmp];
+      :set cardNext ($cardNext + 1);
+      :set isN 0
+      :set isAc 0
+      :set chains "0"
+    }
+    # ignore card power
+    :if ($tmp~"[SHP]") do={}
+
+    #get 802.11 protocol
+    :if ($tmp = "n") do={ :set isN 1;}
+    :if ($tmp = "a") do={
+      :set tmp ($tmp . [:pick $list ($pos+1)])
+      :if ($tmp = "ac") do={ :set isAc 1; :set pos ($pos+1)} else={
+        :log warning "defconf: Invalid 802.11 protocol, expected 'ac'";
+      }
+    }
+    #get chains
+    :if ($tmp = "D") do={ :set chains "0,1" }
+    :if ($tmp = "T") do={ :set chains "0,1,2" }
+    :if ($tmp = "Q") do={
+      :if ($isAc = 1) do={ :set chains "0,1,2,3" } else={
+        :log warning "defconf: quad chains are only for 'ac' boards";
+      }
+    }
+    :set pos ($pos+1)
+  } while=($pos < [:len $list])
+  # add last card to the list
+  :set ($outArray->"w$cardNext") {"chains"=$chains;"isAc"=$isAc;"isN"=$isN;"frequencyMode"=$frequency}
+
+  :return $outArray
+}
+
+
+#-------------------------------------------------------------------------------
+# setWlan - set wlan config from parsed wirelss feature array
+#-------------------------------------------------------------------------------
+:global setWlan do={
+  #access to global funcs
+  :global addConfLine;
+  :global addDescLine;
+  :global wirelessAcEnabled;
+  # wireless bands for 2 and 5 GHz
+  :local band;
+  :local band2;
+  :local band5;
+  :local freq ($list->"frequencyMode");
+  :local isAc ($list->"isAc");
+  :local isN ($list->"isN");
+  :local htChains ($list->"chains")
+
+  $addConfLine ("  /interface wireless {")
+  # construct bands
+  :if ($isAc = 1 && $wirelessAcEnabled= 1) do={
+    :set band5 "5ghz-a/n/ac";
+  } else={
+    :if ($isN=1) do={ :set band5 "5ghz-a/n" } else={ :set band5 "5ghz-a" }
+  }
+  :if ($isN=1) do={ :set band2 "2ghz-b/g/n"} else={ :set band2 "2ghz-b/g" }
+
+  :if ($freq = 5 || $freq = 6) do={ :set band $band5; } else={ :set band $band2; }
+
+  :local chains "";
+  :if ($wirelessAcEnabled= 1) do={
+    :set chains "tx-chains=$htChains rx-chains=$htChains"
+  } else={
+    :set chains "ht-txchains=$htChains ht-rxchains=$htChains"
+  }
+
+  :if ($mode = "disabled") do={
+    $addConfLine ("  disable wlan$ifc")
+  } else={
+    $addConfLine ("    set wlan$ifc mode=$mode band=$band $chains \\")
+    $addConfLine ("      disabled=no wireless-protocol=$wProto distance=$distance")
+  }
+
+  :if ($mode = "ap-bridge" || $mode = "bridge") do={
+    $addConfLine ("    :local wlanMac  [/interface wireless get wlan$ifc mac-address];")
+    $addConfLine ("    :set ssid \"MikroTik-\$[:pick \$wlanMac 9 11]\$[:pick \$wlanMac 12 14]\$[:pick \$wlanMac 15 17]\"")
+    $addConfLine ("    set wlan$ifc ssid=\$ssid")
+
+  }
+
+  :if ($frequency != "") do={
+    $addConfLine ("    set wlan$ifc frequency=$frequency")
+  }
+
+  $addDescLine ("#| wlan$ifc Configuration:")
+  $addDescLine ("#|     mode:          $mode;")
+  $addDescLine ("#|     band:          $band;")
+  $addDescLine ("#|     ht-chains:     $htChains;")
+
+
+  :if ($wirelessAcEnabled = 1) do={
+    $addDescLine ("#|     ht-extension:  20/40mhz-Ce;")
+    :if ($mode = "disabled") do={} else={
+      $addConfLine ("    set wlan$ifc channel-width=20/40mhz-Ce ;")
+    }
+  } else={
+    $addDescLine ("#|     ht-extension:  20/40mhz-ht-above;")
+    $addConfLine ("    set wlan$ifc channel-width=20/40mhz-ht-above ;")
+  }
+  $addConfLine ("  }")
+}
+
+
+#-------------------------------------------------------------------------------
+# setLanPort - apply configuration related to LAN (switches, bridges, dhcp server)
+#-------------------------------------------------------------------------------
+:global setLan do={
+  #access to global funcs
+  :global addConfLine;
+  :global addDescLine;
+  :global dhcpEnabled;
+
+  $addDescLine ("#| LAN Configuration:")
+  #------------set switch ports------------
+  :if ($switchPorts != "") do={
+    :local tmpSwitchPorts "";
+
+    $addConfLine (" /interface ethernet {")
+    :if ($switchPortGroups > 1) do={
+      :foreach i in=$switchPorts do={
+        :set tmpSwitchPorts "$[:pick $i 0] (master)";
+
+        :local tmpMasterName "$[:pick $i 0]-master";
+        $addConfLine ("   set $[:pick $i 0] name=$tmpMasterName;")
+
+        :for j from=1 to=([:len $i]-1) do={
+          :set tmpSwitchPorts "$tmpSwitchPorts, $[:pick $i $j]";
+        }
+        $addDescLine ("#|     switch group: $tmpSwitchPorts")
+
+        :for j from=1 to=([:len $i]-1) do={
+          $addConfLine ("   set $[:pick $i $j] master-port=$tmpMasterName;")
+        }
+      }
+    } else={
+        :set tmpSwitchPorts "$[:pick $switchPorts 0] (master)";
+        :local tmpMasterName "$[:pick $switchPorts 0]-master";
+
+        $addConfLine ("   set $[:pick $switchPorts 0] name=$tmpMasterName;")
+
+        :for i from=1 to=([:len $switchPorts]-1) do={
+          :set tmpSwitchPorts "$tmpSwitchPorts, $[:pick $switchPorts $i]";
+        }
+        $addDescLine ("#|     switch group: $tmpSwitchPorts")
+
+        :for i from=1 to=([:len $switchPorts]-1) do={
+          $addConfLine ("   set $[:pick $switchPorts $i] master-port=$tmpMasterName;")
+        }
+    }
+    $addConfLine (" }$NL")
+  }
+
+  :if ($lanPort = "bridge") do={
+    #bridge all interfaces that are not wan or slave ports
+    $addConfLine (" /interface bridge")
+    $addConfLine ("   add name=$lanPort disabled=no auto-mac=yes protocol-mode=rstp comment=defconf;")
+    $addConfLine (" :local bMACIsSet 0;")
+
+    :if ($wanPorts!="") do={
+      :local tmpWanPorts "";
+      :foreach i in=$wanPorts do={
+        :set tmpWanPorts "$tmpWanPorts || name~\"$i\"";
+      }
+      $addConfLine (" :foreach k in=[/interface find where !(slave=yes $tmpWanPorts || name~\"$lanPort\")] do={")
+    } else={
+      $addConfLine (" :foreach k in=[/interface find where !(slave=yes)] do={")
+    }
+    $addConfLine ("   :log info \"k: \$k\"")
+    $addConfLine ("   :local tmpPortName [/interface get \$k name];")
+    $addConfLine ("   :log info \"port: \$tmpPortName\"")
+    $addConfLine ("   :if (\$bMACIsSet = 0) do={")
+    $addConfLine ("     :if ([/interface get \$k type] = \"ether\") do={")
+    $addConfLine ("       /interface bridge set \"$lanPort\" auto-mac=no admin-mac=[/interface ethernet get \$tmpPortName mac-address];")
+    $addConfLine ("       :set bMACIsSet 1;")
+    $addConfLine ("     }")
+    $addConfLine ("   }")
+    $addConfLine ("   /interface bridge port")
+    $addConfLine ("     add bridge=$lanPort interface=\$tmpPortName comment=defconf;")
+    $addConfLine (" }")
+  }
+  $addConfLine ("  /ip address add address=192.168.88.1/24 interface=$lanPort comment=\"defconf\";")
+
+  #------------set DHCP server on LAN ports------------
+  :if ( $dhcpServer = 1 && $dhcpEnabled = 1) do={
+    $addDescLine "#|     DHCP Server: enabled;"
+    $addConfLine ("   /ip pool add name=\"default-dhcp\" ranges=192.168.88.10-192.168.88.254;")
+    $addConfLine ("   /ip dhcp-server")
+    $addConfLine ("     add name=defconf address-pool=\"default-dhcp\" interface=$lanPort lease-time=10m disabled=no;")
+    $addConfLine ("   /ip dhcp-server network")
+    $addConfLine ("     add address=192.168.88.0/24 gateway=192.168.88.1 comment=\"defconf\";")
+  }
+}
+
+#-------------------------------------------------------------------------------
+# setWanPort - apply configuration related to WAN protection
+#-------------------------------------------------------------------------------
+:global setWanPort do={
+  #access to global funcs
+  :global addConfLine;
+  :global addDescLine;
+  :global dhcpEnabled;
+
+  :if ($wanPorts != "") do={
+    :local tmpWanPorts "";
+    $addDescLine ("#| WAN (gateway) Configuration:")
+
+    :foreach i in=$wanPorts do={
+      :set tmpWanPorts ($tmpWanPorts . $i . " ");
+    }
+    :if ( $isLte = 1) do={
+      $addConfLine ("     /interface lte set [find] add-default-route=yes;")
+    } else={
+      :if ( $dhcpEnabled = 1) do={
+        :foreach i in=$wanPorts do={
+          $addConfLine ("   /ip dhcp-client add interface=$i disabled=no comment=\"defconf\";")
+        }
+      }
+    }
+
+    $addDescLine ("#|     gateway:  $tmpWanPorts;")
+    $addDescLine "#|     firewall:  enabled;"
+    $addDescLine "#|     NAT:   enabled;"
+    :if ( $isLte = 0 && $dhcpEnabled = 1) do={
+      $addDescLine "#|     DHCP Client: enabled;"
+    }
+
+    # add NAT
+    :foreach i in=$wanPorts do={
+      $addConfLine (" /ip firewall nat add chain=srcnat out-interface=$i action=masquerade comment=\"defconf: masquerade\"")
+    }
+    # protect WAN port
+    $addConfLine (" /ip firewall {")
+    $addConfLine ("   filter add chain=input action=accept protocol=icmp comment=\"defconf: accept ICMP\"")
+    $addConfLine ("   filter add chain=input action=accept connection-state=established,related comment=\"defconf: accept established,related\"")
+
+    :foreach i in=$wanPorts do={
+      $addConfLine ("   filter add chain=input action=drop in-interface=$i comment=\"defconf: drop all from WAN\"")
+    }
+    # add forward chain rules
+    $addConfLine ("   filter add chain=forward action=fasttrack-connection connection-state=established,related comment=\"defconf: fasttrack\"")
+    $addConfLine ("   filter add chain=forward action=accept connection-state=established,related comment=\"defconf: accept established,related\"")
+    $addConfLine ("   filter add chain=forward action=drop connection-state=invalid comment=\"defconf: drop invalid\"")
+    :foreach i in=$wanPorts do={
+      $addConfLine ("   filter add chain=forward action=drop connection-state=new connection-nat-state=!dstnat in-interface=$i comment=\"defconf:  drop all from WAN not DSTNATed\"")
+    }
+    $addConfLine (" }")
+
+    :foreach i in=$wanPorts do={
+      $addConfLine (" /ip neighbor discovery set [find name=\"$i\"] discover=no")
+    }
+
+    $addConfLine (" /tool mac-server disable [find];")
+    $addConfLine (" /tool mac-server mac-winbox disable [find];")
+
+    :if ($wanPorts!="") do={
+      :local tmpWanPorts "";
+      :foreach i in=$wanPorts do={
+        :set tmpWanPorts "$tmpWanPorts || name~\"$i\"";
+      }
+      $addConfLine (" :foreach k in=[/interface find where !(slave=yes $tmpWanPorts)] do={")
+    } else={
+      $addConfLine (" :foreach k in=[/interface find where !(slave=yes)] do={")
+    }
+    $addConfLine ("   :local tmpName [/interface get \$k name];")
+    $addConfLine ("   /tool mac-server add interface=\$tmpName disabled=no;")
+    $addConfLine ("   /tool mac-server mac-winbox add interface=\$tmpName disabled=no;")
+    $addConfLine (" }")
+  }
+}
+
+#-------------------------------------------------------------------------------
+# allowDns - enable dns remote request and staitc DNS name
+#-------------------------------------------------------------------------------
+:global allowDns do={
+  #access to global funcs
+  :global addConfLine;
+  :global addDescLine;
+
+  $addDescLine "#|     DNS: enabled;"
+  # allow DNS
+  $addConfLine (" /ip dns {")
+  $addConfLine ("     set allow-remote-requests=yes")
+  $addConfLine ("     static add name=router address=192.168.88.1")
+  $addConfLine (" }")
+  $addConfLine ("")
+}
+
+#-----------------------------------------------------------------------------------------
+# RB Configuration Variable Defs
+#-----------------------------------------------------------------------------------------
+:local boardName;
+:local marketingName;
+:local licenseLevel;
+
+# get board name
+:set boardName [/system routerboard get model];
+:set marketingName [/system resource get board-name];
+:set licenseLevel [/system license get nlevel];
+
+
+# name of wan port
+:local wanPorts "";
+# name of local port
+:local lanPort "ether1";
+# list of switched ports (if empty switch is not configured)
+:local switchPorts "";
+# by default only one switch group
+:local switchPortGroups 1;
+#------------wireless------------
+# whether board has wireless
+:local useWirelessAc 0;
+:local numWlans 0;
+# station or AP
+:local mode1 "";
+:local mode2 "";
+:local frequency "auto";
+# ht extension
+#:local chanWidth "";
+:local distance "dynamic";
+# wireless protocol
+:local wProto "any";
+
+# whether to block access from wan port
+:local secureWAN 1;
+
+
+#-------------------------------------------------------------------------------
+# Match RBs
+#-------------------------------------------------------------------------------
+
+#get board prefix, model and wireless features
+:local board [$getFeatureString boardStr=$boardName]
+:local wlanOpt;
+
+:if ($board->"wireless" != "" && $board->"isLte" != 1) do={
+  :set wlanOpt [$parseWirelessFeatures list=($board->"wireless")]
+
+  :set numWlans [:len $wlanOpt];
+
+  :local count 0;
+  :local bFail 0;
+  :while ([:len [/interface wireless find]] != $numWlans && $bFail = 0) do={
+    :delay 1s;
+    :set count ($count +1);
+    :if ($count = 30) do={
+      :set bFail 1;
+      :log warning "DefConf: Unable to find wireless interface(s)";
+    }
+  };
+  # delay because pci-e wlans sometimes may load later
+  :delay 5s;
+  #:set numWlans [:len [/interface wireless find]];
+  #:log info "DefConf: $numWlans wireless interfaces detected";
+}
+# :log info $board
+# :log info $wlanOpt
+
+# RouterBoard configs
+:if ($board->"prefix"~"RouterBOARD") do={
+
+  :if ($board->"model"~"450|750|850|miniROUTER") do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    :set lanPort "ether2-master";
+    :set switchPorts {"ether2";"ether3";"ether4";"ether5"};
+  }
+
+  :if ($board->"model"~"SXT") do={
+    :set configMode "cpe_router";
+    if ($numWlans > 1) do={
+      :set wanPorts {"wlan2"};
+      :set lanPort "bridge";
+      :set mode1 "disabled";
+      :set mode2 "station";
+    } else={
+      :if ($board->"isLte" = 1) do={
+        :set wanPorts {"lte1"};
+      } else={
+        :set wanPorts {"wlan1"};
+      }
+      :set lanPort "ether1";
+    }
+  }
+
+  :if ($board->"model"~"QRT") do={
+    :set configMode "cpe_router";
+    :set wanPorts {"wlan1"};
+    :set lanPort "ether1";
+  }
+
+  :if ($board->"model"~"mAP") do={
+    :set configMode "ap_router"
+    :set wanPorts {"ether1"};
+    if ($board->"other"~"^L") do={
+      :set lanPort "wlan1";
+    } else={
+      :set lanPort "bridge";
+    }
+  }
+
+  :if ($board->"model"~"wAP") do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    if ($numWlans > 1) do={
+      :set lanPort "bridge";
+    } else={
+      :set lanPort "wlan1";
+    }
+  }
+
+  # hAP mini
+  :if ($board->"model"~"931") do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    :set lanPort "bridge";
+    :set switchPorts {"ether2";"ether3"};
+  }
+
+  #hAP
+  :if ($board->"model"~"hAP|952|962") do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    :set lanPort "bridge";
+    :set switchPorts {"ether2";"ether3";"ether4";"ether5"};
+  }
+  # cAP
+  :if ($board->"model"~"cAP") do={
+    :set configMode "wisp_bridge";
+    :set distance "indoors";
+    :set wProto "802.11";
+  }
+
+  :if ($board->"model"~"tAP") do={
+    :set configMode "repeater";
+    :set mode1      "bridge";
+    :set mode2      "station";
+  }
+
+  :if ($board->"model"~"LHG") do={
+    :set configMode "cpe_router";
+    :set wanPorts {"wlan1"};
+    :set lanPort "ether1";
+  }
+
+  # hAP Lite (RB941)
+  :if ($board->"model"~"941") do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    :set lanPort "bridge";
+    :set switchPorts {"ether2";"ether3";"ether4";};
+  }
+
+  :if ($board->"model"~"751|951") do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    :set lanPort "bridge";
+    :set switchPorts {"ether2";"ether3";"ether4";"ether5"};
+  }
+
+  :if ($board->"model"~"953") do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    :set lanPort "bridge";
+    :set switchPorts {"ether2";"ether3";"sfp1"};
+  }
+
+  :if ($board->"model"~"Groove|Metal|711") do={
+    :if ($board->"isAp" = 1) do={
+      :set configMode "wisp_bridge";
+    } else={
+      :set configMode "cpe_router";
+      :set wanPorts {"wlan1"};
+      :set lanPort "ether1";
+    };
+  }
+
+  :if ($board->"model"~"OmniTIK") do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    :set lanPort "bridge";
+    :set switchPorts {"ether2";"ether3";"ether4";"ether5"};
+  }
+
+  :if ($board->"model"~"OmniGroove") do={
+    :set configMode "wisp_bridge";
+  }
+
+  :if ($board->"model"~"DynaDish") do={
+    :set configMode "ptp_bridge";
+    :set wanPorts {"wlan1"};
+    :set mode1 "station";
+  }
+
+  :if ($board->"model"~"911|912") do={
+    :if ($licenseLevel = 3 || $marketingName~"^QRT") do={
+      :set configMode "cpe_router";
+      :set wanPorts {"wlan1"};
+      :set lanPort "ether1";
+    } else={ if ($licenseLevel = 4) do={
+        :set configMode "wisp_bridge";
+      }
+    }
+  }
+
+  #NetMetal
+  :if ($board->"model"~"921|922|A21") do={
+    :if ($licenseLevel = 3) do={
+      :set configMode "cpe_router";
+      :set wanPorts {"wlan1"};
+      :set lanPort "bridge";
+    }
+    # it should be AP if license level is 4
+    :if ($licenseLevel = 4) do={
+      :set configMode "wisp_bridge";
+    }
+  }
+
+  # hEX
+  :if ($board->"model"~"960") do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    :set lanPort "bridge";
+    :set switchPorts {"ether2";"ether3";"ether4";"ether5"};
+  }
+
+  :if ($board->"model"~"2011|3011") do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    :set lanPort "bridge";
+    :set switchPortGroups 2;
+    :set switchPorts {{"ether2";"ether3";"ether4";"ether5"};{"ether6";"ether7";"ether8";"ether9";"ether10"}};
+  }
+}
+# CloudRouterSwitches
+:if ($board->"prefix"~"CloudRouterSwitch") do={
+  :local startGig 0
+  :local startSfp 0
+  :local startCombo 0
+  :local startSfpPlus 0
+
+  :if ($numWlans > 0) do={
+    :set configMode "ap_router";
+    :set wanPorts {"ether1"};
+    :set lanPort "bridge";
+    :set switchPorts {"ether2"};
+    :set startGig 3
+    :set startSfp 1;
+  } else={
+    :set configMode "switch";
+    :if (($board->"numCombo") > 0) do={
+      :set lanPort "combo1-master";
+      :set switchPorts {"combo1"};
+      :set startCombo 2
+    } else={
+      :set lanPort "ether1-master";
+      :set switchPorts {"ether1"};
+      :set startGig 2
+    }
+    :set startSfp 1;
+  }
+  :if ($board->"numGig" > 0 && $startGig <= $board->"numGig") do={
+    :for i from=$startGig to=($board->"numGig") do={
+      :set switchPorts ($switchPorts+"ether$i")
+    }
+  }
+  :if ($board->"numSfp" > 0 && $startSfp <= $board->"numSfp") do={
+    :for i from=$startSfp to=($board->"numSfp") do={
+      :if ($board->"model"~"112") do={
+        :set switchPorts ($switchPorts+"sfp$[($i+8)]")
+      } else={
+        :set switchPorts ($switchPorts+"sfp$i")
+      }
+    }
+  }
+  :if ($board->"numSfpPlus" >= 1) do={
+    :if ($board->"model"~"226|210" ) do={
+      :set switchPorts ($switchPorts+"sfp-sfpplus1")
+      :set switchPorts ($switchPorts+"sfpplus2")
+    } else={
+      :for i from=($startSfpPlus+1) to=($board->"numSfpPlus") do={
+        :set switchPorts ($switchPorts+"sfpplus$i")
+      }
+    }
+  }
+}
+
+#-------------------------------------------------------------------------------
+# Generate Config and Description
+#-------------------------------------------------------------------------------
+
+#Perform additional checks on installed packages
+:if ([:len [/system package find name="dhcp" !disabled]] != 0) do={
+  :set dhcpEnabled 1;
+}
+:if ([:len [/system package find name="wireless-fp" !disabled]] != 0  || \
+     [:len [/system package find name="wireless-rep" !disabled]] != 0 || \
+     [:len [/system package find name="wireless-cm" !disabled]] != 0  || \
+     [:len [/system package find name="wireless-cm2" !disabled]] != 0 ) do={
+  :set wirelessAcEnabled 1;
+} else={
+  #set if wireless enabled
+  :if ([:len [/system package find name~"wireless" !disabled]] != 0) do={
+    :set wirelessEnabled 1;
+  }
+}
+
+:if ($numWlans > 0) do={
+    [$addDescLine ":global ssid;"]
+}
+$addConfLine ":log info Starting_defconf_script_;"
+$addConfLine ":global action;"
+$addConfLine (\
+"#-------------------------------------------------------------------------------$NL\
+# Apply configuration.$NL\
+# these commands are executed after installation or configuration reset$NL\
+#-------------------------------------------------------------------------------")
+$addConfLine (\
+":if (\$action = \"apply\") do={$NL\
+  # wait for interfaces$NL\
+  :local count 0; $NL\
+  :while ([/interface ethernet find] = \"\") do={ $NL\
+    :if (\$count = 30) do={$NL\
+      :log warning \"DefConf: Unable to find ethernet interfaces\";$NL\
+      /quit;$NL\
+    }$NL\
+    :delay 1s; :set count (\$count +1); $NL\
+  };$NL")
+
+  if ($numWlans > 0) do={
+    # wait wlans
+    $addConfLine ("  :local count 0;")
+    $addConfLine ("  :while ([/interface wireless print count-only] < $numWlans) do={ ")
+    $addConfLine ("    :set count (\$count +1);")
+    $addConfLine ("    :if (\$count = 30) do={")
+    $addConfLine ("      :log warning \"DefConf: Unable to find wireless interface(s)\"; ")
+    $addConfLine ("      /ip address add address=192.168.88.1/24 interface=ether1 comment=\"defconf\";")
+    $addConfLine ("      /quit")
+    $addConfLine ("    }")
+    $addConfLine ("    :delay 1s;")
+    $addConfLine ("  };")
+  }
+  if ($board->"isLte" = 1) do={
+    # wait wlans
+    $addConfLine ("  :local count 0;")
+    $addConfLine ("  :while ([/interface lte find] = \"\") do={ ")
+    $addConfLine ("    :set count (\$count +1);")
+    $addConfLine ("    :if (\$count = 30) do={")
+    $addConfLine ("      :log warning \"DefConf: Unable to find LTE interface(s)\"; ")
+    $addConfLine ("      /ip address add address=192.168.88.1/24 interface=ether1 comment=\"defconf\";")
+    $addConfLine ("      /quit")
+    $addConfLine ("    }")
+    $addConfLine ("    :delay 1s;")
+    $addConfLine ("  };")
+  }
+
+#-------------apply only IP on ether1-------------------------------------------
+:if ($configMode = "") do={
+  $addDescLine "#|     IP on ether1:    192.168.88.1/24;"
+  $addConfLine ("/ip address add address=192.168.88.1/24 interface=ether1 comment=\"defconf\";")
+}
+
+#-------------CPE mode two possibilities wlan CPE and LTE CPE-------------------
+:if ($configMode = "cpe_router") do={
+  $addDescLine (\
+  "#| CPE RouterMode:$NL\
+   #|  * wireless interface connected to providers network (WAN port);$NL\
+   #|  * WAN port is protected by firewall and enabled DHCP client$NL\
+   #|  * IP address 192.168.88.1/24 is set on LAN port")
+
+
+  :if ($board->"isLte" != 1) do={
+    :if ($wirelessEnabled = 1 || $wirelessAcEnabled = 1) do={
+      :if ($numWlans > 1) do={
+        [$setWlan ifc=1 list=($wlanOpt->"w2") mode=$mode1 frequency=$frequency wProto=$wProto distance=$distance]
+        [$setWlan ifc=2 list=($wlanOpt->"w1") mode=$mode2 frequency=$frequency wProto=$wProto distance=$distance]
+      } else={
+        [$setWlan ifc=1 list=($wlanOpt->"w1") mode="station" frequency=$frequency wProto=$wProto distance=$distance]
+      }
+    }
+  }
+
+  [$setLan switchPorts=$switchPorts lanPort=$lanPort dhcpServer=1 wanPorts=$wanPorts]
+  [$allowDns]
+  [$setWanPort wanPorts=$wanPorts isLte=($board->"isLte")]
+}
+
+#-------------repeater config---------------------------------------------------
+:if ($configMode = "repeater") do={
+
+  $addDescLine (\
+  "#| Repeater Mode:$NL\
+   #|  * both wireless interfaces are bridged$NL\
+   #|  * 192.168.88.1/24 on ether1")
+
+  $addConfLine ("  /interface bridge")
+  $addConfLine ("    add name=bridge-repeater disabled=no auto-mac=yes protocol-mode=rstp comment=defconf;")
+
+  $addConfLine ("  :foreach k in=[/interface wireless find] do={")
+  $addConfLine ("    /interface bridge port")
+  $addConfLine ("      add bridge=bridge-repeater interface=\$k comment=defconf;")
+  $addConfLine ("  }")
+
+  $addConfLine ("  /ip address add address=192.168.88.1/24 interface=ether1 comment=defconf;")
+  $addConfLine ("")
+
+  :if ($wirelessEnabled = 1 || $wirelessAcEnabled = 1) do={
+   [$setWlan ifc=1 list=($wlanOpt->"w1") mode=$mode1 frequency=$frequency wProto=$wProto distance=$distance]
+   [$setWlan ifc=2 list=($wlanOpt->"w2") mode=$mode2 frequency=$frequency wProto=$wProto distance=$distance]
+  }
+
+}
+
+#-------------WISP bridge config (AP)-------------------------------------------
+:if ($configMode = "wisp_bridge") do={
+  $addDescLine (\
+  "#| WISP Bridge:$NL\
+   #|  * wireless and LAN interfaces are bridged;$NL\
+   #|  * IP address 192.168.88.1/24 is set on bridge")
+
+  :if ($wirelessEnabled = 1 || $wirelessAcEnabled = 1) do={
+    [$setWlan ifc=1 list=($wlanOpt->"w1") mode="ap-bridge" frequency=$frequency wProto=$wProto distance=$distance]
+  }
+  # lan port is always bridge in this mode
+  :set lanPort "bridge"
+  [$setLan switchPorts=$switchPorts lanPort=$lanPort dhcpServer=0]
+}
+
+
+#-------------PTP bridge config (client, AP)------------------------------------
+:if ($configMode = "ptp_bridge") do={
+  $addDescLine (\
+  "#| PTP Bridge:$NL\
+   #|  * wireless and LAN interfaces are bridged;$NL\
+   #|  * IP address 192.168.88.1/24 is set on bridge")
+
+  :if ($wirelessEnabled = 1 || $wirelessAcEnabled = 1) do={
+    [$setWlan ifc=1 list=($wlanOpt->"w1") mode=$mode1 frequency=$frequency wProto=$wProto distance=$distance]
+  }
+  # lan port is always bridge in this mode
+  :set lanPort "bridge"
+  [$setLan switchPorts=$switchPorts lanPort=$lanPort dhcpServer=0]
+}
+
+#-------------AP Router (dual, single)------------------------------------------
+:if ($configMode = "ap_router") do={
+  $addDescLine (\
+  "#| RouterMode:$NL\
+   #|  * WAN port is protected by firewall and enabled DHCP client")
+  :if ($numWlans > 0) do={
+    $addDescLine ("#|  * Wireless interfaces are part of LAN bridge")
+  }
+  $addDescLine ( "#|  * IP address 192.168.88.1/24 is set on LAN port")
+
+  :set frequency "auto";
+  :set distance "indoors";
+  :set wProto "802.11";
+
+  :if ($numWlans > 0) do={
+    :if ($wirelessEnabled = 1 || $wirelessAcEnabled = 1) do={
+      :if ($numWlans > 1) do={
+        [$setWlan ifc=1 list=($wlanOpt->"w2") mode="ap-bridge" frequency=$frequency wProto=$wProto distance=$distance]
+        [$setWlan ifc=2 list=($wlanOpt->"w1") mode="ap-bridge" frequency=$frequency wProto=$wProto distance=$distance]
+      } else={
+        [$setWlan ifc=1 list=($wlanOpt->"w1") mode="ap-bridge" frequency=$frequency wProto=$wProto distance=$distance]
+      }
+    }
+  }
+
+  [$setLan switchPorts=$switchPorts lanPort=$lanPort dhcpServer=1 switchPortGroups=$switchPortGroups wanPorts=$wanPorts]
+  [$allowDns]
+  [$setWanPort wanPorts=$wanPorts]
+}
+
+#------------- Switch ----------------------------------------------------------
+:if ($configMode = "switch") do={
+  $addDescLine (\
+  "#| Switch mode:$NL\
+   #|  * all interfaces switched;$NL\
+   #|  * IP address 192.168.88.1/24 is set on LAN port")
+
+  [$setLan switchPorts=$switchPorts lanPort=$lanPort dhcpServer=0]
+}
+
+# "apply" closing brace
+$addConfLine ("}")
+
+$addConfLine (\
+"#-------------------------------------------------------------------------------$NL\
+# Revert configuration.$NL\
+# these commands are executed if user requests to remove default configuration$NL\
+#-------------------------------------------------------------------------------")
+
+$addConfLine (":if (\$action = \"revert\") do={")
+
+$addConfLine ("# remove wan port protection")
+$addConfLine (" /ip firewall filter remove [find comment~\"defconf\"]")
+$addConfLine (" /ip firewall nat remove [find comment~\"defconf\"]")
+$addConfLine (" /tool mac-server remove [find interface!=all]")
+$addConfLine (" /tool mac-server set [find] disabled=no")
+
+$addConfLine (" /tool mac-server mac-winbox remove [find interface!=all]")
+$addConfLine (" /tool mac-server mac-winbox set [find] disabled=no")
+
+$addConfLine (" /ip neighbor discovery set [find ] discover=yes")
+
+#remove DHCP config
+$addConfLine ("   :local o [/ip dhcp-server network find comment=\"defconf\"]")
+$addConfLine ("   :if ([:len \$o] != 0) do={ /ip dhcp-server network remove \$o }")
+
+$addConfLine ("   :local o [/ip dhcp-server find name=\"defconf\" !disabled]")
+$addConfLine ("   :if ([:len \$o] != 0) do={ /ip dhcp-server remove \$o }")
+
+$addConfLine ("   /ip pool {")
+$addConfLine ("     :local o [find name=\"default-dhcp\" ranges=192.168.88.10-192.168.88.254]")
+$addConfLine ("     :if ([:len \$o] != 0) do={ remove \$o }")
+$addConfLine ("   }")
+
+$addConfLine ("   :local o [/ip dhcp-client find comment=\"defconf\"]")
+$addConfLine ("   :if ([:len \$o] != 0) do={ /ip dhcp-client remove \$o }")
+
+$addConfLine (" /ip dns {")
+$addConfLine ("   set allow-remote-requests=no")
+$addConfLine ("   :local o [static find name=router address=192.168.88.1]")
+$addConfLine ("   :if ([:len \$o] != 0) do={ static remove \$o }")
+$addConfLine (" }")
+
+$addConfLine (" /ip address {")
+$addConfLine ("   :local o [find comment=\"defconf\"]")
+$addConfLine ("   :if ([:len \$o] != 0) do={ remove \$o }")
+$addConfLine (" }")
+
+# reset ethernets
+$addConfLine (" :foreach iface in=[/interface ethernet find] do={")
+$addConfLine ("   /interface ethernet set \$iface name=[get \$iface default-name]")
+:if ($switchPorts != "") do={
+  $addConfLine ("   /interface ethernet set \$iface master-port=none")
+}
+$addConfLine (" }")
+# remove bridge
+$addConfLine (" /interface bridge port remove [find comment=\"defconf\"]")
+$addConfLine (" /interface bridge remove [find comment=\"defconf\"]")
+
+# reset wireless
+:if ($wirelessEnabled = 1 || $wirelessAcEnabled = 1) do={
+    :for i from=1 to=$numWlans do={
+      $addConfLine (" /interface wireless reset-configuration wlan$i")
+    }
+}
+
+$addConfLine ("}")
+$addConfLine ":log info Defconf_script_finished;"
+
+#-------------------------------------------------------------------------------
+# Conf and descr output
+#-------------------------------------------------------------------------------
+:put $strDesc;
+:put $strConf;
+
+#-------------------------------------------------------------------------------
+# Clear global vars
+#-------------------------------------------------------------------------------
+:set strDesc;
+:set strConf;
+:set NL;
+
+:set findNextSection;
+:set getFeatureString;
+:set isNum;
+:set parseWirelessFeatures;
+:set setWlan;
+:set allowDns;
+:set setLan;
+:set setWanPort;
+
+:set configMode;
+:set dhcpEnabled;
+:set wirelessEnabled;
+:set wirelessAcEnabled;
+
+:set addConfLine;
+:set addDescLine;
